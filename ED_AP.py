@@ -1,5 +1,6 @@
 import math
 import os
+import time
 import traceback
 from datetime import timedelta
 from enum import Enum
@@ -319,10 +320,13 @@ class EDAutopilot:
         self.gui_loaded = False
         self._nav_cor_x = 0.0  # Nav Point correction to pitch
         self._nav_cor_y = 0.0  # Nav Point correction to yaw
-        self.target_align_outer_lim = 1.0  # In deg. Anything outside of this range will cause alignment.
+        self.target_align_outer_lim = 2.0  # In deg. Anything outside of this range will cause alignment.
         self.target_align_inner_lim = 0.5  # In deg. Will stop alignment when in this range.
         self.debug_show_compass_overlay = False
         self.debug_show_target_overlay = False
+        self._target_miss_count = 0
+        self._target_last_autocal_ts = 0.0
+        self._fsd_precharge_active = False
 
         # Overlay vars
         self.ap_state = "Idle"
@@ -1281,8 +1285,17 @@ class EDAutopilot:
             if self.debug_images:
                 f = get_timestamped_filename('[get_target_offset] no_target_match', '', '.png')
                 cv2.imwrite(f'{self.debug_image_folder}/{f}', dst_image)
+            self._target_miss_count += 1
+            if not disable_auto_cal and self._target_miss_count >= 3:
+                now = time.time()
+                if now - self._target_last_autocal_ts > 30.0:
+                    self.ap_ckb('log', f'Target not found {self._target_miss_count}x; quick calibrating target.')
+                    self._target_last_autocal_ts = now
+                    self.quick_calibrate_target()
+                    self._target_miss_count = 0
             result = None
         else:
+            self._target_miss_count = 0
             result = {'roll': round(final_roll_deg, 2), 'pit': round(final_pit_deg, 2), 'yaw': round(final_yaw_deg, 2), 'occ': occluded}
 
         return result
@@ -1769,8 +1782,8 @@ class EDAutopilot:
         self.set_speed_50()
         res = self.compass_align(scr_reg)
         # Quick calibrate the compass
-        if res:
-            self.quick_calibrate_compass()
+        # if res:
+        #     self.quick_calibrate_compass()
 
         self.ap_ckb('log+vce', 'Target Align')
         for i in range(5):
@@ -1782,6 +1795,7 @@ class EDAutopilot:
 
             elif align_res == ScTargetAlignReturn.Found:
                 self.set_speed_100()
+                self._try_start_fsd_precharge()
                 return
 
             elif align_res == ScTargetAlignReturn.Disengage:
@@ -1799,6 +1813,7 @@ class EDAutopilot:
             'disengage': Disengage text found
         """
         target_align_compass_mult = 3  # Multiplier to close and target_align_inner_lim when using compass for align.
+        compass_adjust_factor = 0.6  # Dampen compass-only adjustments to prevent oscillation.
         target_align_pit_off = 0.25  # In deg. To keep the target above the center line (prevent it going down out of view).
 
         target_pit = target_align_pit_off
@@ -1809,6 +1824,7 @@ class EDAutopilot:
         target_align_inner_lim = self.target_align_inner_lim
 
         off = None
+        used_compass = False
         tar_off1 = None
         nav_off1 = None
         tar_off2 = None
@@ -1828,6 +1844,7 @@ class EDAutopilot:
             elif nav_off1:
                 # Try to use the compass data if the target is not visible.
                 off = nav_off1
+                used_compass = True
                 self.ap_ckb('log+vce', 'Using Compass for Target Align')
 
                 # We are using compass align, increase the values as compass is much less accurate
@@ -1891,15 +1908,16 @@ class EDAutopilot:
             # Calc pitch time based on nav point location
             logger.debug(f"sc_target_align before: pit: {off['pit']} yaw: {off['yaw']} ")
 
+            adj_factor = compass_adjust_factor if used_compass else 1.0
             p_deg = 0.0
             if abs(off['pit']) > target_align_outer_lim:
-                p_deg = off['pit']
+                p_deg = off['pit'] * adj_factor
                 self.pitch_up_down(p_deg)
 
             # Calc yaw time based on nav point location
             y_deg = 0.0
             if abs(off['yaw']) > target_align_outer_lim:
-                y_deg = off['yaw']
+                y_deg = off['yaw'] * adj_factor
                 self.yaw_right_left(y_deg)
 
             # Wait for ship to finish moving and picture to stabilize
@@ -1916,6 +1934,7 @@ class EDAutopilot:
             elif nav_off2:
                 # Try to use the compass data if the target is not visible.
                 off = nav_off2
+                used_compass = True
                 self.ap_ckb('log+vce', 'Using Compass for Target Align')
                 # Check if Target is now behind us
                 if nav_off2['z'] < 0:
@@ -1969,6 +1988,12 @@ class EDAutopilot:
                 logger.debug("sc_target_align lost target")
                 self.ap_ckb('log', 'Target Align failed - lost target.')
                 return ScTargetAlignReturn.Lost
+
+        # If we only used compass data and never visually detected the target, don't claim alignment.
+        if used_compass and tar_off1 is None and tar_off2 is None:
+            logger.debug("sc_target_align compass-only alignment; target not visible")
+            self.ap_ckb('log', 'Target Align failed - target not visible.')
+            return ScTargetAlignReturn.Lost
 
         # We are aligned, so define the navigation correction as the current offset. This won't be 100% accurate, but
         # will be within a few degrees.
@@ -2092,10 +2117,31 @@ class EDAutopilot:
             sleep(0.5)
             logger.debug('jump= start fsd')
 
-            # Initiate FSD Jump
-            self.keys.send('HyperSuperCombination')
+            # If we already started jumping (precharge), just wait for completion.
+            if self.status.get_flag(FlagsFsdJump):
+                logger.debug('jump= already in jump')
+                res = self.status.wait_for_flag_off(FlagsFsdJump, 360)
+                if not res:
+                    logger.error('FSD failure to complete jump timeout.')
+                    continue
+                logger.debug('jump= speed 0')
+                self.jump_cnt = self.jump_cnt + 1
+                self.set_speed_0(repeat=3)  # Let's be triply sure that we set speed to 0% :)
+                sleep(1)  # wait 1 sec after jump to allow graphics to stablize and accept inputs
+                logger.debug('jump=complete')
+                self.start_sco_monitoring()
+                self._fsd_precharge_active = False
+                return True
 
-            res = self.status.wait_for_flag_on(FlagsFsdCharging, 5)
+            # Initiate FSD Jump if not already charging
+            if not self.status.get_flag(FlagsFsdCharging) and not self.status.get_flag(FlagsFsdJump):
+                self.keys.send('HyperSuperCombination')
+            self._fsd_precharge_active = False
+
+            if not self.status.get_flag(FlagsFsdCharging):
+                res = self.status.wait_for_flag_on(FlagsFsdCharging, 5)
+            else:
+                res = True
             if not res:
                 logger.error('FSD failed to charge.')
                 continue
@@ -2507,6 +2553,19 @@ class EDAutopilot:
         self.set_speed_50()
 
         return True
+
+    def _try_start_fsd_precharge(self):
+        """Begin FSD charge early while aligning to reduce jump delay."""
+        if self._fsd_precharge_active:
+            return
+        if self.status.get_flag(FlagsFsdCharging) or self.status.get_flag(FlagsFsdJump):
+            self._fsd_precharge_active = True
+            return
+        if self.jn.ship_state()['status'] not in ('in_supercruise', 'in_space'):
+            return
+
+        self.keys.send('HyperSuperCombination')
+        self._fsd_precharge_active = True
 
     def waypoint_assist(self, keys, scr_reg):
         """ Processes the waypoints, performing jumps and sc assist if going to a station
@@ -3300,7 +3359,7 @@ class EDAutopilot:
         # # self.set_speed_50()
         # self.pitch_up_down(angle)
 
-        target_align_outer_lim = 1.0
+        target_align_outer_lim = 2.0
         target_align_inner_lim = 0.5
 
         off = None
